@@ -1,36 +1,39 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  View, 
-  Text, 
-  TouchableOpacity, 
-  StyleSheet, 
-  ScrollView, 
+import React, { useState, useEffect } from "react";
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  ScrollView,
   TextInput,
   Alert,
   Modal,
-  Platform,
-  ActivityIndicator
-} from 'react-native';
-import { CameraView, Camera } from 'expo-camera';
-import DateTimePicker from '@react-native-community/datetimepicker';
-import { 
-  getRentals, 
-  addRental, 
-  finishRental, 
+  ActivityIndicator,
+} from "react-native";
+import { CameraView, Camera } from "expo-camera";
+import DateTimePicker from "@react-native-community/datetimepicker";
+import {
+  getRentals,
+  addRentalWithSync,
+  finishRentalWithSync,
   getMachines,
   addPayment,
   addPendingPayment,
-  getPartners
-} from '../services/firestoreService';
+  getPartners,
+  getSharedPartnerMachines,
+  updateMachine,
+  extendRental,
+} from "../services/firestoreService";
 
-import { 
-  scheduleRentalNotification, 
-  cancelRentalNotifications
-  } from '../services/notificationService';
+import {
+  scheduleRentalNotification,
+  cancelRentalNotifications,
+} from "../services/notificationService";
 
 export default function RentalsScreen({ navigation }) {
   const [rentals, setRentals] = useState([]);
   const [machines, setMachines] = useState([]);
+  const [sharedMachines, setSharedMachines] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [showFinishModal, setShowFinishModal] = useState(null);
@@ -39,7 +42,6 @@ export default function RentalsScreen({ navigation }) {
   const [hasPermission, setHasPermission] = useState(null);
   const [scanned, setScanned] = useState(false);
 
-  // Para selectores de fecha
   const [showStartDatePicker, setShowStartDatePicker] = useState(false);
   const [showStartTimePicker, setShowStartTimePicker] = useState(false);
   const [showEndDatePicker, setShowEndDatePicker] = useState(false);
@@ -47,28 +49,27 @@ export default function RentalsScreen({ navigation }) {
   const [showMachineDropdown, setShowMachineDropdown] = useState(false);
   const [showPartnerDropdown, setShowPartnerDropdown] = useState(false);
 
-  // Para el modal de extender
-  const [extendPrice, setExtendPrice] = useState('16000');
+  const [extendPrice, setExtendPrice] = useState("16000");
 
-  // Formulario
   const [formData, setFormData] = useState({
-    addressType: 'Calle',
-    address: '',
+    addressType: "Calle",
+    address: "",
     startDate: new Date(),
-    endDate: new Date(Date.now() + 24*60*60*1000),
-    machineId: '',
+    endDate: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    machineId: "",
     partnerId: null,
-    price: ''
+    partnerName: null,
+    machineOwnerUserId: null,
+    price: "",
   });
 
-  // Lista de socios desde Firebase
   const [partners, setPartners] = useState([]);
 
   useEffect(() => {
     loadData();
-    
+
     const interval = setInterval(() => {
-      setRentals(prev => [...prev]);
+      setRentals((prev) => [...prev]);
     }, 60000);
 
     return () => clearInterval(interval);
@@ -77,21 +78,28 @@ export default function RentalsScreen({ navigation }) {
   const loadData = async () => {
     try {
       setLoading(true);
-      const [rentalsData, machinesData, partnersData] = await Promise.all([
-        getRentals(),
-        getMachines(),
-        getPartners()
-      ]);
+      const [rentalsData, machinesData, partnersData, sharedMachinesData] =
+        await Promise.all([
+          getRentals(),
+          getMachines(),
+          getPartners(),
+          getSharedPartnerMachines(),
+        ]);
+
       setRentals(rentalsData);
       setMachines(machinesData);
       setPartners(partnersData);
-      const availableMachines = machinesData.filter(m => m.status === 'disponible');
+      setSharedMachines(sharedMachinesData);
+
+      const availableMachines = machinesData.filter(
+        (m) => m.status === "disponible",
+      );
       if (availableMachines.length > 0 && !formData.machineId) {
-        setFormData(prev => ({ ...prev, machineId: availableMachines[0].id }));
+        setFormData((prev) => ({ ...prev, machineId: availableMachines[0].id }));
       }
     } catch (error) {
-      console.error('Error al cargar datos:', error);
-      Alert.alert('Error', 'No se pudieron cargar los datos');
+      console.error("Error al cargar datos:", error);
+      Alert.alert("Error", "No se pudieron cargar los datos");
     } finally {
       setLoading(false);
     }
@@ -99,18 +107,18 @@ export default function RentalsScreen({ navigation }) {
 
   const requestCameraPermission = async () => {
     const { status } = await Camera.requestCameraPermissionsAsync();
-    setHasPermission(status === 'granted');
-    return status === 'granted';
+    setHasPermission(status === "granted");
+    return status === "granted";
   };
 
   const handleOpenQRScanner = async () => {
-    const hasPermission = await requestCameraPermission();
-    
-    if (!hasPermission) {
+    const granted = await requestCameraPermission();
+
+    if (!granted) {
       Alert.alert(
-        'Permiso Necesario',
-        'Necesitamos acceso a la cámara para escanear códigos QR.',
-        [{ text: 'OK' }]
+        "Permiso Necesario",
+        "Necesitamos acceso a la cámara para escanear códigos QR.",
+        [{ text: "OK" }],
       );
       return;
     }
@@ -121,251 +129,232 @@ export default function RentalsScreen({ navigation }) {
 
   const handleBarCodeScanned = ({ data }) => {
     if (scanned) return;
-    
-    setScanned(true);
-    console.log('QR escaneado:', data);
 
-    // Buscar la lavadora por ID
-    const machine = machines.find(m => m.id === data);
+    setScanned(true);
+    const machine = machines.find((m) => m.id === data);
 
     if (machine) {
-      if (machine.status !== 'disponible') {
+      if (machine.status !== "disponible") {
         Alert.alert(
-          'Lavadora No Disponible',
+          "Lavadora No Disponible",
           `La lavadora #${machine.number} está actualmente ${machine.status}.`,
           [
-            { 
-              text: 'Buscar Otra', 
-              onPress: () => setScanned(false) 
-            },
-            {
-              text: 'Cerrar',
-              onPress: () => setShowQRScanner(false)
-            }
-          ]
+            { text: "Buscar Otra", onPress: () => setScanned(false) },
+            { text: "Cerrar", onPress: () => setShowQRScanner(false) },
+          ],
         );
         return;
       }
 
-      // Cargar la lavadora en el formulario
-      setFormData({
-        ...formData,
+      setFormData((prev) => ({
+        ...prev,
         machineId: machine.id,
-        partnerId: null
-      });
+        partnerId: null,
+        partnerName: null,
+        machineOwnerUserId: null,
+      }));
 
       Alert.alert(
-        '¡Escaneado! ✅',
+        "¡Escaneado! ✅",
         `Lavadora #${machine.number} - ${machine.brand} (${machine.capacity}kg)\n\nAhora completa los datos del alquiler.`,
         [
           {
-            text: 'Continuar',
+            text: "Continuar",
             onPress: () => {
               setShowQRScanner(false);
               setShowForm(true);
-            }
-          }
-        ]
+            },
+          },
+        ],
       );
     } else {
       Alert.alert(
-        'QR No Reconocido',
-        'Este código QR no corresponde a ninguna lavadora registrada.',
+        "QR No Reconocido",
+        "Este código QR no corresponde a ninguna lavadora registrada.",
         [
-          { 
-            text: 'Escanear Otro', 
-            onPress: () => setScanned(false) 
-          },
-          {
-            text: 'Cerrar',
-            onPress: () => setShowQRScanner(false)
-          }
-        ]
+          { text: "Escanear Otro", onPress: () => setScanned(false) },
+          { text: "Cerrar", onPress: () => setShowQRScanner(false) },
+        ],
       );
     }
   };
 
   const handleAddRental = async () => {
-  if (!formData.address || (!formData.machineId && !formData.partnerId) || !formData.price) {
-    Alert.alert('Error', 'Por favor completa todos los campos obligatorios');
-    return;
-  }
-
-  try {
-    const rentalData = {
-      addressType: formData.addressType,
-      address: formData.address,
-      startDate: formData.startDate.toISOString(),
-      endDate: formData.endDate.toISOString(),
-      machineId: formData.machineId || null,
-      partnerId: formData.partnerId || null,
-      price: Number(formData.price),
-      status: 'activo'
-    };
-
-    const newRental = await addRental(rentalData);
-    
-    if (formData.machineId) {
-      const { updateMachine } = require('../services/firestoreService');
-      await updateMachine(formData.machineId, { status: 'alquilada' });
+    if (
+      !formData.address ||
+      (!formData.machineId && !formData.partnerId) ||
+      !formData.price
+    ) {
+      Alert.alert("Error", "Por favor completa todos los campos obligatorios");
+      return;
     }
 
-    // NUEVO: Programar notificaciones para este alquiler
-    const machine = machines.find(m => m.id === formData.machineId);
-    await scheduleRentalNotification(
-      { ...rentalData, id: newRental.id }, 
-      machine?.number || 'Sin número'
-    );
+    try {
+      const rentalData = {
+        addressType: formData.addressType,
+        address: formData.address,
+        startDate: formData.startDate.toISOString(),
+        endDate: formData.endDate.toISOString(),
+        machineId: formData.machineId || null,
+        partnerId: formData.partnerId || null,
+        partnerName: formData.partnerName || null,
+        machineOwnerUserId: formData.machineOwnerUserId || null,
+        price: Number(formData.price),
+        status: "activo",
+      };
 
-    Alert.alert('Éxito', 'Alquiler creado correctamente');
-    setShowForm(false);
-    setShowQRScanner(false);
-    resetForm();
-    loadData();
-  } catch (error) {
-    console.error('Error al crear alquiler:', error);
-    Alert.alert('Error', 'No se pudo crear el alquiler');
-  }
-};
+      const newRental = await addRentalWithSync(rentalData);
+
+      if (formData.machineId && !formData.machineOwnerUserId) {
+        await updateMachine(formData.machineId, { status: "alquilada" });
+      }
+
+      const machine = machines.find((m) => m.id === formData.machineId);
+      await scheduleRentalNotification(
+        { ...rentalData, id: newRental.id },
+        machine?.number || "Sin número",
+      );
+
+      Alert.alert("Éxito", "Alquiler creado correctamente");
+      setShowForm(false);
+      setShowQRScanner(false);
+      resetForm();
+      loadData();
+    } catch (error) {
+      console.error("Error al crear alquiler:", error);
+      Alert.alert("Error", error.message || "No se pudo crear el alquiler");
+    }
+  };
 
   const handleExtendRental = async () => {
     if (!showExtendModal || !extendPrice) {
-      Alert.alert('Error', 'Ingresa el precio a agregar');
+      Alert.alert("Error", "Ingresa el precio a agregar");
       return;
     }
 
     try {
       const rental = showExtendModal;
-      const { updateDoc, doc } = require('firebase/firestore');
-      const { db, auth } = require('../services/firebase');
-      const { extendRental } = require('../services/firestoreService');
-      
-      const newEndDate = new Date(new Date(rental.endDate).getTime() + 24*60*60*1000).toISOString();
+      const { updateDoc, doc } = require("firebase/firestore");
+      const { db, auth } = require("../services/firebase");
+
+      const newEndDate = new Date(
+        new Date(rental.endDate).getTime() + 24 * 60 * 60 * 1000,
+      ).toISOString();
       const newPrice = rental.price + Number(extendPrice);
 
-      const rentalRef = doc(db, 'users', auth.currentUser.uid, 'rentals', rental.id);
+      const rentalRef = doc(db, "users", auth.currentUser.uid, "rentals", rental.id);
       await updateDoc(rentalRef, {
         endDate: newEndDate,
-        price: newPrice
+        price: newPrice,
       });
 
-      // Actualizar estadísticas de la lavadora si existe
-      if (rental.machineId) {
+      if (rental.machineId && !rental.isSharedViewOnly) {
         await extendRental(rental.id, rental.machineId, Number(extendPrice));
       }
 
-      Alert.alert('Éxito', `24 horas agregadas. Nuevo precio: $${newPrice.toLocaleString()}`);
+      Alert.alert(
+        "Éxito",
+        `24 horas agregadas. Nuevo precio: $${newPrice.toLocaleString()}`,
+      );
       setShowExtendModal(null);
-      setExtendPrice('16000');
+      setExtendPrice("16000");
       loadData();
     } catch (error) {
-      Alert.alert('Error', 'No se pudo extender el alquiler');
+      Alert.alert("Error", "No se pudo extender el alquiler");
     }
   };
 
   const handleFinishRental = async (paid) => {
-  if (!showFinishModal) return;
+    if (!showFinishModal) return;
 
-  try {
-    const rental = showFinishModal;
-    const machine = machines.find(m => m.id === rental.machineId);
+    try {
+      const rental = showFinishModal;
+      const machine = machines.find((m) => m.id === rental.machineId);
 
-    if (paid) {
-      // VERIFICAR SI HAY SOCIO INVOLUCRADO
-      if (rental.partnerId) {
-        const partner = partners.find(p => p.id === rental.partnerId);
-        
-        if (partner) {
-          // CALCULAR DIVISIÓN
-          const partnerAmount = Math.floor(rental.price * (partner.percentage / 100));
-          const yourAmount = rental.price - partnerAmount;
+      if (paid) {
+        if (rental.partnerId) {
+          const partner = partners.find((p) => p.id === rental.partnerId);
 
-          // TU PARTE
-          await addPayment({
-            amount: yourAmount,
-            date: new Date().toISOString().split('T')[0],
-            machineNumber: machine?.number || 'Socio',
-            address: `${rental.addressType} ${rental.address}`,
-            type: 'pagado',
-            notes: `Tu ${100 - partner.percentage}% (Socio: ${partner.name})`
-          });
+          if (partner) {
+            const partnerAmount = Math.floor(
+              rental.price * (partner.percentage / 100),
+            );
+            const yourAmount = rental.price - partnerAmount;
 
-          // PARTE DEL SOCIO (guardar para estadísticas)
-          // Nota: Esta función la crearemos después en firestoreService
-          console.log(`💰 Socio ${partner.name} gana: $${partnerAmount}`);
-          
-          Alert.alert(
-            '💰 Pago Dividido',
-            `Total: $${rental.price.toLocaleString()}\n\n` +
-            `• Tú (${100 - partner.percentage}%): $${yourAmount.toLocaleString()}\n` +
-            `• ${partner.name} (${partner.percentage}%): $${partnerAmount.toLocaleString()}`
-          );
+            await addPayment({
+              amount: yourAmount,
+              date: new Date().toISOString().split("T")[0],
+              machineNumber: machine?.number || "Socio",
+              address: `${rental.addressType} ${rental.address}`,
+              type: "pagado",
+              notes: `Tu ${100 - partner.percentage}% (Socio: ${partner.name})`,
+            });
+
+            Alert.alert(
+              "💰 Pago Dividido",
+              `Total: $${rental.price.toLocaleString()}\n\n` +
+                `• Tú (${100 - partner.percentage}%): $${yourAmount.toLocaleString()}\n` +
+                `• ${partner.name} (${partner.percentage}%): $${partnerAmount.toLocaleString()}`,
+            );
+          } else {
+            await addPayment({
+              amount: rental.price,
+              date: new Date().toISOString().split("T")[0],
+              machineNumber: machine?.number || "Socio",
+              address: `${rental.addressType} ${rental.address}`,
+              type: "pagado",
+            });
+          }
         } else {
-          // SOCIO NO ENCONTRADO - TODO PARA TI
           await addPayment({
             amount: rental.price,
-            date: new Date().toISOString().split('T')[0],
-            machineNumber: machine?.number || 'Socio',
+            date: new Date().toISOString().split("T")[0],
+            machineNumber: machine?.number || "Socio",
             address: `${rental.addressType} ${rental.address}`,
-            type: 'pagado'
+            type: "pagado",
           });
         }
       } else {
-        // SIN SOCIO - TODO PARA TI
-        await addPayment({
-          amount: rental.price,
-          date: new Date().toISOString().split('T')[0],
-          machineNumber: machine?.number || 'Socio',
+        await addPendingPayment({
+          clientName: "Cliente",
           address: `${rental.addressType} ${rental.address}`,
-          type: 'pagado'
+          amount: rental.price,
+          machineNumber: machine?.number || "Socio",
+          date: new Date().toISOString().split("T")[0],
+          partnerId: rental.partnerId || null,
         });
       }
-    } else {
-      // CLIENTE DEBE
-      await addPendingPayment({
-        clientName: 'Cliente',
-        address: `${rental.addressType} ${rental.address}`,
-        amount: rental.price,
-        machineNumber: machine?.number || 'Socio',
-        date: new Date().toISOString().split('T')[0],
-        partnerId: rental.partnerId || null
-      });
+
+      await finishRentalWithSync(rental.id, paid);
+      await cancelRentalNotifications(rental.id);
+
+      if (!paid || !rental.partnerId) {
+        Alert.alert("Éxito", paid ? "Pago registrado" : "Agregado a pendientes");
+      }
+
+      setShowFinishModal(null);
+      loadData();
+    } catch (error) {
+      console.error("Error al finalizar:", error);
+      Alert.alert("Error", "No se pudo finalizar el alquiler");
     }
-
-    await finishRental(rental.id, paid);
-
-    if (rental.machineId) {
-      const { updateMachine } = require('../services/firestoreService');
-      await updateMachine(rental.machineId, { status: 'disponible' });
-    }
-
-    // Cancelar notificaciones
-    await cancelRentalNotifications(rental.id);
-
-    if (!paid || !rental.partnerId) {
-      Alert.alert('Éxito', paid ? 'Pago registrado' : 'Agregado a pendientes');
-    }
-    
-    setShowFinishModal(null);
-    loadData();
-  } catch (error) {
-    console.error('Error al finalizar:', error);
-    Alert.alert('Error', 'No se pudo finalizar el alquiler');
-  }
-};
+  };
 
   const resetForm = () => {
-  const availableMachines = machines
-    .filter(m => m.status === 'disponible')
-    .sort((a, b) => Number(a.number) - Number(b.number));
+    const availableMachines = machines
+      .filter((m) => m.status === "disponible")
+      .sort((a, b) => Number(a.number) - Number(b.number));
+
     setFormData({
-      addressType: 'Calle',
-      address: '',
+      addressType: "Calle",
+      address: "",
       startDate: new Date(),
-      endDate: new Date(Date.now() + 24*60*60*1000),
-      machineId: availableMachines[0]?.id || '',
+      endDate: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      machineId: availableMachines[0]?.id || "",
       partnerId: null,
-      price: ''
+      partnerName: null,
+      machineOwnerUserId: null,
+      price: "",
     });
   };
 
@@ -374,25 +363,22 @@ export default function RentalsScreen({ navigation }) {
     const end = new Date(endDate);
     const diff = end - now;
 
-    if (diff <= 0) {
-      return { text: 'VENCIDO', color: '#DC2626' };
-    }
+    if (diff <= 0) return { text: "VENCIDO", color: "#DC2626" };
 
     const hours = Math.floor(diff / (1000 * 60 * 60));
     const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-
-    const color = hours < 2 ? '#DC2626' : hours < 6 ? '#F59E0B' : '#10B981';
+    const color = hours < 2 ? "#DC2626" : hours < 6 ? "#F59E0B" : "#10B981";
 
     return { text: `${hours}h ${minutes}m`, color };
   };
 
   const formatDateTime = (date) => {
-    return date.toLocaleString('es-CO', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
+    return date.toLocaleString("es-CO", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
     });
   };
 
@@ -439,12 +425,18 @@ export default function RentalsScreen({ navigation }) {
   };
 
   const availableMachines = machines
-  .filter(m => m.status === 'disponible')
-  .sort((a, b) => Number(a.number) - Number(b.number));
-const selectedMachine = machines.find(m => m.id === formData.machineId);
-const selectedPartner = partners.find(p => p.id === formData.partnerId);
+    .filter((m) => m.status === "disponible")
+    .sort((a, b) => Number(a.number) - Number(b.number));
 
-  if (loading) {
+  const selectedMachine =
+    machines.find((m) => m.id === formData.machineId) ||
+    sharedMachines.find(
+      (m) =>
+        m.id === formData.machineId &&
+        m.ownerUserId === formData.machineOwnerUserId,
+    );
+
+  const selectedPartner = partners.find((p) => p.id === formData.partnerId);  if (loading) {
     return (
       <View style={styles.container}>
         <View style={styles.header}>
@@ -455,7 +447,7 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
           <View style={{ width: 70 }} />
         </View>
         <View style={styles.center}>
-          <ActivityIndicator size="large" color="#0691b4ff" />
+          <ActivityIndicator size="large" color="#2563EB" />
           <Text style={styles.loadingText}>Cargando...</Text>
         </View>
       </View>
@@ -468,39 +460,39 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
         <TouchableOpacity onPress={() => navigation.goBack()}>
           <Text style={styles.backText}>← Atrás</Text>
         </TouchableOpacity>
+
         <View>
-          <Text style={styles.headerTitle}>Alquileres</Text>
+          <Text style={styles.headerTitle}>Alquileres 🚚</Text>
           <Text style={styles.headerSubtitle}>{rentals.length} activos</Text>
         </View>
-        <View style={styles.headerButtons}>
-          <TouchableOpacity 
-            style={styles.qrButton}
-            onPress={handleOpenQRScanner}
-          >
-            <Text style={styles.qrButtonText}>📱</Text>
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={styles.addButton}
-            onPress={() => {
-              resetForm();
-              setShowForm(true);
-            }}
-          >
-            <Text style={styles.addButtonText}>+ Nuevo</Text>
-          </TouchableOpacity>
-        </View>
+
+        <TouchableOpacity
+          style={styles.addButton}
+          onPress={() => {
+            resetForm();
+            setShowForm(true);
+          }}
+        >
+          <Text style={styles.addButtonText}>+ Nuevo</Text>
+        </TouchableOpacity>
       </View>
 
-      <ScrollView style={styles.content}>
+      <View style={styles.quickActions}>
+        <TouchableOpacity style={styles.qrButton} onPress={handleOpenQRScanner}>
+          <Text style={styles.qrButtonText}>📷 Escanear QR</Text>
+        </TouchableOpacity>
+      </View>
+
+      <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         {rentals.length === 0 ? (
           <View style={styles.empty}>
-            <Text style={styles.emptyText}>📦</Text>
+            <Text style={styles.emptyIcon}>🧺</Text>
             <Text style={styles.emptyTitle}>No hay alquileres activos</Text>
             <Text style={styles.emptySubtitle}>Crea tu primer alquiler</Text>
           </View>
         ) : (
-          rentals.map(rental => {
-            const machine = machines.find(m => m.id === rental.machineId);
+          rentals.map((rental) => {
+            const machine = machines.find((m) => m.id === rental.machineId);
             const timeData = getTimeRemaining(rental.endDate);
 
             return (
@@ -511,7 +503,11 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
                       {rental.addressType} {rental.address}
                     </Text>
                     <Text style={styles.rentalMachine}>
-                      {rental.machineId ? `Lavadora #${machine?.number} - ${machine?.brand}` : 'Lavadora de Socio'}
+                      {rental.machineId
+                        ? `Lavadora #${machine?.number || rental.machineId} - ${
+                            machine?.brand || rental.partnerName || "Socio"
+                          }`
+                        : "Lavadora de Socio"}
                     </Text>
                     <View style={styles.rentalDates}>
                       <Text style={styles.dateText}>
@@ -519,30 +515,47 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
                       </Text>
                     </View>
                   </View>
+
                   <View style={styles.rentalPrice}>
-                    <Text style={styles.priceAmount}>${rental.price.toLocaleString()}</Text>
-                    <View style={[styles.timeRemaining, { backgroundColor: timeData.color }]}>
+                    <Text style={styles.priceAmount}>
+                      ${Number(rental.price || 0).toLocaleString()}
+                    </Text>
+                    <View
+                      style={[styles.timeRemaining, { backgroundColor: timeData.color }]}
+                    >
                       <Text style={styles.timeText}>⏱️ {timeData.text}</Text>
                     </View>
                   </View>
                 </View>
 
                 <View style={styles.rentalActions}>
-                  <TouchableOpacity 
-                    style={[styles.actionButton, styles.extendButton]}
+                  <TouchableOpacity
+                    style={[
+                      styles.actionButton,
+                      styles.extendButton,
+                      rental.isSharedViewOnly && styles.disabledAction,
+                    ]}
+                    disabled={rental.isSharedViewOnly}
                     onPress={() => {
                       setShowExtendModal(rental);
-                      setExtendPrice('16000');
+                      setExtendPrice("16000");
                     }}
                   >
                     <Text style={styles.actionButtonText}>⏰ +24h</Text>
                   </TouchableOpacity>
 
-                  <TouchableOpacity 
-                    style={[styles.actionButton, styles.finishButton]}
+                  <TouchableOpacity
+                    style={[
+                      styles.actionButton,
+                      styles.finishButton,
+                      rental.isSharedViewOnly && styles.disabledAction,
+                    ]}
+                    disabled={rental.isSharedViewOnly}
                     onPress={() => setShowFinishModal(rental)}
                   >
-                    <Text style={styles.actionButtonText}>✅ Finalizar</Text>
+                    <Text style={styles.actionButtonText}>
+                      {rental.isSharedViewOnly ? "👁️ Solo lectura" : "✅ Finalizar"}
+                    </Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -551,12 +564,12 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
         )}
       </ScrollView>
 
-      {/* Modal de QR Scanner */}
+      {/* Modal QR */}
       <Modal visible={showQRScanner} animationType="slide">
         <View style={styles.scannerContainer}>
           <View style={styles.scannerHeader}>
             <Text style={styles.scannerTitle}>Escanear QR de Lavadora</Text>
-            <TouchableOpacity 
+            <TouchableOpacity
               style={styles.closeScanner}
               onPress={() => {
                 setShowQRScanner(false);
@@ -571,9 +584,7 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
             style={styles.camera}
             facing="back"
             onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
-            barcodeScannerSettings={{
-              barcodeTypes: ['qr'],
-            }}
+            barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
           >
             <View style={styles.scannerOverlay}>
               <View style={styles.scannerFrame}>
@@ -582,7 +593,6 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
                 <View style={[styles.corner, styles.bottomLeft]} />
                 <View style={[styles.corner, styles.bottomRight]} />
               </View>
-              
               <Text style={styles.scannerInstructions}>
                 Apunta la cámara al código QR de la lavadora
               </Text>
@@ -598,7 +608,7 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
         </View>
       </Modal>
 
-      {/* Modal de Formulario */}
+      {/* Modal Formulario */}
       <Modal visible={showForm} animationType="slide" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -606,27 +616,30 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
               <Text style={styles.modalTitle}>Nuevo Alquiler</Text>
 
               <Text style={styles.label}>Tipo de Dirección</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.typeScroll}>
-                {['Calle', 'Carrera', 'Torre', 'Diagonal', 'Transversal', 'Otro'].map(type => (
-                  <TouchableOpacity
-                    key={type}
-                    style={[
-                      styles.typeButton,
-                      formData.addressType === type && styles.typeButtonActive
-                    ]}
-                    onPress={() => setFormData({ ...formData, addressType: type })}
-                  >
-                    <Text style={[
-                      styles.typeButtonText,
-                      formData.addressType === type && styles.typeButtonTextActive
-                    ]}>
-                      {type}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-
-              <Text style={styles.label}>Dirección *</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                {["Calle", "Carrera", "Torre", "Diagonal", "Transversal", "Otro"].map(
+                  (type) => (
+                    <TouchableOpacity
+                      key={type}
+                      style={[
+                        styles.typeButton,
+                        formData.addressType === type && styles.typeButtonActive,
+                      ]}
+                      onPress={() => setFormData({ ...formData, addressType: type })}
+                    >
+                      <Text
+                        style={[
+                          styles.typeButtonText,
+                          formData.addressType === type &&
+                            styles.typeButtonTextActive,
+                        ]}
+                      >
+                        {type}
+                      </Text>
+                    </TouchableOpacity>
+                  ),
+                )}
+              </ScrollView>              <Text style={styles.label}>Dirección *</Text>
               <TextInput
                 style={styles.input}
                 value={formData.address}
@@ -636,20 +649,24 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
 
               <Text style={styles.label}>Fecha y Hora de Entrega *</Text>
               <View style={styles.dateTimeRow}>
-                <TouchableOpacity 
+                <TouchableOpacity
                   style={styles.dateButton}
                   onPress={() => setShowStartDatePicker(true)}
                 >
                   <Text style={styles.dateButtonText}>
-                    📅 {formData.startDate.toLocaleDateString('es-CO')}
+                    📅 {formData.startDate.toLocaleDateString("es-CO")}
                   </Text>
                 </TouchableOpacity>
-                <TouchableOpacity 
+                <TouchableOpacity
                   style={styles.timeButton}
                   onPress={() => setShowStartTimePicker(true)}
                 >
                   <Text style={styles.dateButtonText}>
-                    🕐 {formData.startDate.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })}
+                    🕐{" "}
+                    {formData.startDate.toLocaleTimeString("es-CO", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -674,20 +691,24 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
 
               <Text style={styles.label}>Fecha y Hora de Retiro *</Text>
               <View style={styles.dateTimeRow}>
-                <TouchableOpacity 
+                <TouchableOpacity
                   style={styles.dateButton}
                   onPress={() => setShowEndDatePicker(true)}
                 >
                   <Text style={styles.dateButtonText}>
-                    📅 {formData.endDate.toLocaleDateString('es-CO')}
+                    📅 {formData.endDate.toLocaleDateString("es-CO")}
                   </Text>
                 </TouchableOpacity>
-                <TouchableOpacity 
+                <TouchableOpacity
                   style={styles.timeButton}
                   onPress={() => setShowEndTimePicker(true)}
                 >
                   <Text style={styles.dateButtonText}>
-                    🕐 {formData.endDate.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })}
+                    🕐{" "}
+                    {formData.endDate.toLocaleTimeString("es-CO", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -717,28 +738,45 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
                 onPress={() => setShowMachineDropdown(!showMachineDropdown)}
               >
                 <Text style={styles.dropdownText}>
-                  {selectedMachine ? `#${selectedMachine.number} - ${selectedMachine.brand}` : 'Ninguna (usar socio)'}
+                  {selectedMachine
+                    ? `#${selectedMachine.number} - ${selectedMachine.brand}`
+                    : "Ninguna (usar socio)"}
                 </Text>
-                <Text style={styles.dropdownArrow}>{showMachineDropdown ? '▲' : '▼'}</Text>
+                <Text style={styles.dropdownArrow}>
+                  {showMachineDropdown ? "▲" : "▼"}
+                </Text>
               </TouchableOpacity>
 
               {showMachineDropdown && (
-  <ScrollView style={styles.dropdownList} nestedScrollEnabled={true}>
+                <ScrollView style={styles.dropdownList} nestedScrollEnabled={true}>
                   <TouchableOpacity
                     style={styles.dropdownItem}
                     onPress={() => {
-                      setFormData({ ...formData, machineId: null });
+                      setFormData({
+                        ...formData,
+                        machineId: null,
+                        machineOwnerUserId: null,
+                        partnerName: null,
+                      });
                       setShowMachineDropdown(false);
                     }}
                   >
-                    <Text style={styles.dropdownItemText}>Ninguna (usar socio)</Text>
+                    <Text style={styles.dropdownItemText}>
+                      Ninguna (usar socio)
+                    </Text>
                   </TouchableOpacity>
-                  {availableMachines.map(machine => (
+                  {availableMachines.map((machine) => (
                     <TouchableOpacity
                       key={machine.id}
                       style={styles.dropdownItem}
                       onPress={() => {
-                        setFormData({ ...formData, machineId: machine.id, partnerId: null });
+                        setFormData({
+                          ...formData,
+                          machineId: machine.id,
+                          partnerId: null,
+                          machineOwnerUserId: null,
+                          partnerName: null,
+                        });
                         setShowMachineDropdown(false);
                       }}
                     >
@@ -756,9 +794,11 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
                 onPress={() => setShowPartnerDropdown(!showPartnerDropdown)}
               >
                 <Text style={styles.dropdownText}>
-                  {selectedPartner ? selectedPartner.name : 'Ninguno'}
+                  {selectedPartner ? selectedPartner.name : "Ninguno"}
                 </Text>
-                <Text style={styles.dropdownArrow}>{showPartnerDropdown ? '▲' : '▼'}</Text>
+                <Text style={styles.dropdownArrow}>
+                  {showPartnerDropdown ? "▲" : "▼"}
+                </Text>
               </TouchableOpacity>
 
               {showPartnerDropdown && (
@@ -766,25 +806,83 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
                   <TouchableOpacity
                     style={styles.dropdownItem}
                     onPress={() => {
-                      setFormData({ ...formData, partnerId: null });
+                      setFormData({
+                        ...formData,
+                        partnerId: null,
+                        machineId: null,
+                        partnerName: null,
+                        machineOwnerUserId: null,
+                      });
                       setShowPartnerDropdown(false);
                     }}
                   >
                     <Text style={styles.dropdownItemText}>Ninguno</Text>
                   </TouchableOpacity>
-                  {partners.map(partner => (
-                    <TouchableOpacity
-                      key={partner.id}
-                      style={styles.dropdownItem}
-                      onPress={() => {
-                        setFormData({ ...formData, partnerId: partner.id, machineId: null });
-                        setShowPartnerDropdown(false);
-                      }}
-                    >
-                      <Text style={styles.dropdownItemText}>{partner.name}</Text>
-                    </TouchableOpacity>
-                  ))}
+                  {partners
+                    .filter(
+                      (partner) =>
+                        partner.status === "active" && partner.canUsePartnerMachines,
+                    )
+                    .map((partner) => (
+                      <TouchableOpacity
+                        key={partner.id}
+                        style={styles.dropdownItem}
+                        onPress={() => {
+                          const partnerMachines = sharedMachines.filter(
+                            (machine) => machine.ownerPartnerId === partner.id,
+                          );
+                          setFormData({
+                            ...formData,
+                            partnerId: partner.id,
+                            partnerName: partner.name,
+                            machineId: partnerMachines[0]?.id || null,
+                            machineOwnerUserId:
+                              partnerMachines[0]?.ownerUserId || null,
+                          });
+                          setShowPartnerDropdown(false);
+                        }}
+                      >
+                        <Text style={styles.dropdownItemText}>{partner.name}</Text>
+                      </TouchableOpacity>
+                    ))}
                 </View>
+              )}
+
+              {formData.partnerId && (
+                <>
+                  <Text style={styles.label}>Lavadora de Socio</Text>
+                  <View style={styles.dropdownList}>
+                    {sharedMachines
+                      .filter((machine) => machine.ownerPartnerId === formData.partnerId)
+                      .map((machine) => (
+                        <TouchableOpacity
+                          key={`${machine.ownerUserId}_${machine.id}`}
+                          style={styles.dropdownItem}
+                          onPress={() =>
+                            setFormData({
+                              ...formData,
+                              machineId: machine.id,
+                              machineOwnerUserId: machine.ownerUserId,
+                              partnerName: machine.ownerPartnerName,
+                            })
+                          }
+                        >
+                          <Text style={styles.dropdownItemText}>
+                            {machine.machineName ||
+                              `#${machine.number} - ${machine.brand}`}{" "}
+                            ({machine.capacity}kg)
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    {sharedMachines.filter(
+                      (machine) => machine.ownerPartnerId === formData.partnerId,
+                    ).length === 0 && (
+                      <Text style={styles.hint}>
+                        Este socio no tiene lavadoras disponibles ahora.
+                      </Text>
+                    )}
+                  </View>
+                </>
               )}
 
               <Text style={styles.label}>Precio (COP) *</Text>
@@ -797,7 +895,7 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
               />
 
               <View style={styles.modalButtons}>
-                <TouchableOpacity 
+                <TouchableOpacity
                   style={[styles.modalButton, styles.cancelButton]}
                   onPress={() => {
                     setShowForm(false);
@@ -808,7 +906,7 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
                   <Text style={styles.cancelButtonText}>Cancelar</Text>
                 </TouchableOpacity>
 
-                <TouchableOpacity 
+                <TouchableOpacity
                   style={[styles.modalButton, styles.saveButton]}
                   onPress={handleAddRental}
                 >
@@ -820,7 +918,7 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
         </View>
       </Modal>
 
-      {/* Modal de Extender */}
+      {/* Modal Extender */}
       <Modal visible={showExtendModal !== null} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: 400 }]}>
@@ -836,512 +934,250 @@ const selectedPartner = partners.find(p => p.id === formData.partnerId);
               placeholder="16000"
             />
 
-            <TouchableOpacity 
+            <TouchableOpacity
               style={[styles.finishButton, styles.confirmButton]}
               onPress={handleExtendRental}
             >
-              <Text style={styles.finishButtonText}>✅ Confirmar Extensión</Text>
+              <Text style={styles.actionButtonText}>✅ Confirmar</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity 
-  style={styles.cancelButton}
-  onPress={() => {
-    setShowExtendModal(null);
-    setExtendPrice('16000');
-  }}
->
-  <Text style={styles.cancelButtonText}>Cancelar</Text>
-</TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.cancelButton, styles.confirmButton]}
+              onPress={() => setShowExtendModal(null)}
+            >
+              <Text style={styles.cancelButtonText}>Cancelar</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* Modal de Finalizar */}
+      {/* Modal Finalizar */}
       <Modal visible={showFinishModal !== null} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
-          <View style={[styles.modalContent, { maxHeight: 350 }]}>
+          <View style={[styles.modalContent, { maxHeight: 360 }]}>
             <Text style={styles.modalTitle}>Finalizar Alquiler</Text>
-            <Text style={styles.finishQuestion}>¿El cliente pagó el servicio?</Text>
+            <Text style={styles.extendQuestion}>
+              ¿Cómo deseas finalizar este alquiler?
+            </Text>
 
-        <TouchableOpacity 
-          style={[styles.finishButton, styles.paidButton]}
-          onPress={() => handleFinishRental(true)}
-        >
-          <Text style={styles.finishButtonText}>✅ Cliente Pagó</Text>
-        </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.finishButton, styles.confirmButton]}
+              onPress={() => handleFinishRental(true)}
+            >
+              <Text style={styles.actionButtonText}>💰 Pagado</Text>
+            </TouchableOpacity>
 
-        <TouchableOpacity 
-          style={[styles.finishButton, styles.debtButton]}
-          onPress={() => handleFinishRental(false)}
-        >
-          <Text style={styles.finishButtonText}>⏰ Cliente Debe</Text>
-        </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.extendButton, styles.confirmButton]}
+              onPress={() => handleFinishRental(false)}
+            >
+              <Text style={styles.actionButtonText}>🕒 Pago pendiente</Text>
+            </TouchableOpacity>
 
-        <TouchableOpacity 
-  style={styles.cancelButton}
-  onPress={() => setShowFinishModal(null)}
->
-  <Text style={styles.cancelButtonText}>Cancelar</Text>
-</TouchableOpacity>
-      </View>
+            <TouchableOpacity
+              style={[styles.cancelButton, styles.confirmButton]}
+              onPress={() => setShowFinishModal(null)}
+            >
+              <Text style={styles.cancelButtonText}>Cancelar</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
-  </Modal>
-</View>
-);
+  );
 }
+
 const styles = StyleSheet.create({
-container: {
-flex: 1,
-backgroundColor: '#FAFAFA',
-},
-header: {
-backgroundColor: '#0691b4ff',
-paddingTop: 50,
-paddingBottom: 24,
-paddingHorizontal: 20,
-flexDirection: 'row',
-justifyContent: 'space-between',
-alignItems: 'center',
-borderBottomLeftRadius: 32,
-borderBottomRightRadius: 32,
-},
-backText: {
-color: 'white',
-fontSize: 16,
-fontWeight: '600',
-},
-headerTitle: {
-color: 'white',
-fontSize: 24,
-fontWeight: '800',
-},
-headerSubtitle: {
-color: 'rgba(255,255,255,0.8)',
-fontSize: 14,
-textAlign: 'center',
-marginTop: 4,
-},
-headerButtons: {
-flexDirection: 'row',
-gap: 10,
-},
-qrButton: {
-width: 44,
-height: 44,
-borderRadius: 12,
-backgroundColor: 'rgba(255,255,255,0.25)',
-justifyContent: 'center',
-alignItems: 'center',
-},
-qrButtonText: {
-fontSize: 22,
-},
-addButton: {
-backgroundColor: 'rgba(255,255,255,0.25)',
-paddingHorizontal: 16,
-paddingVertical: 10,
-borderRadius: 12,
-},
-addButtonText: {
-color: 'white',
-fontWeight: '700',
-fontSize: 14,
-},
-content: {
-flex: 1,
-padding: 15,
-},
-center: {
-flex: 1,
-justifyContent: 'center',
-alignItems: 'center',
-},
-loadingText: {
-marginTop: 12,
-fontSize: 16,
-color: '#64748B',
-fontWeight: '500',
-},
-empty: {
-padding: 60,
-alignItems: 'center',
-},
-emptyText: {
-fontSize: 64,
-marginBottom: 15,
-},
-emptyTitle: {
-fontSize: 18,
-fontWeight: 'bold',
-color: '#6B7280',
-marginBottom: 5,
-},
-emptySubtitle: {
-fontSize: 14,
-color: '#9CA3AF',
-},
-rentalCard: {
-backgroundColor: 'white',
-borderRadius: 15,
-padding: 15,
-marginBottom: 15,
-shadowColor: '#000',
-shadowOffset: { width: 0, height: 2 },
-shadowOpacity: 0.1,
-shadowRadius: 3,
-elevation: 3,
-},
-rentalHeader: {
-flexDirection: 'row',
-justifyContent: 'space-between',
-marginBottom: 15,
-},
-rentalInfo: {
-flex: 1,
-},
-rentalAddress: {
-fontSize: 18,
-fontWeight: 'bold',
-color: '#1F2937',
-marginBottom: 5,
-},
-rentalMachine: {
-fontSize: 14,
-color: '#6B7280',
-marginBottom: 8,
-},
-rentalDates: {
-marginTop: 5,
-},
-dateText: {
-fontSize: 12,
-color: '#9CA3AF',
-},
-rentalPrice: {
-alignItems: 'flex-end',
-},
-priceAmount: {
-fontSize: 24,
-fontWeight: 'bold',
-color: '#10B981',
-marginBottom: 8,
-},
-timeRemaining: {
-paddingHorizontal: 12,
-paddingVertical: 6,
-borderRadius: 20,
-},
-timeText: {
-color: 'white',
-fontSize: 12,
-fontWeight: 'bold',
-},
-rentalActions: {
-flexDirection: 'row',
-gap: 10,
-},
-actionButton: {
-flex: 1,
-padding: 12,
-borderRadius: 10,
-alignItems: 'center',
-},
-extendButton: {
-backgroundColor: '#DBEAFE',
-},
-finishButton: {
-backgroundColor: '#D1FAE5',
-},
-actionButtonText: {
-fontWeight: 'bold',
-fontSize: 14,
-},
-// Estilos del escáner QR
-scannerContainer: {
-flex: 1,
-backgroundColor: 'black',
-},
-scannerHeader: {
-paddingTop: 50,
-paddingBottom: 20,
-paddingHorizontal: 20,
-backgroundColor: 'rgba(0,0,0,0.8)',
-flexDirection: 'row',
-justifyContent: 'space-between',
-alignItems: 'center',
-},
-scannerTitle: {
-color: 'white',
-fontSize: 20,
-fontWeight: 'bold',
-},
-closeScanner: {
-backgroundColor: 'rgba(255,255,255,0.2)',
-paddingHorizontal: 15,
-paddingVertical: 8,
-borderRadius: 8,
-},
-closeScannerText: {
-color: 'white',
-fontWeight: '600',
-},
-camera: {
-flex: 1,
-},
-scannerOverlay: {
-flex: 1,
-backgroundColor: 'transparent',
-justifyContent: 'center',
-alignItems: 'center',
-},
-scannerFrame: {
-width: 250,
-height: 250,
-position: 'relative',
-},
-corner: {
-position: 'absolute',
-width: 40,
-height: 40,
-borderColor: '#0691b4ff',
-},
-topLeft: {
-top: 0,
-left: 0,
-borderTopWidth: 4,
-borderLeftWidth: 4,
-},
-topRight: {
-top: 0,
-right: 0,
-borderTopWidth: 4,
-borderRightWidth: 4,
-},
-bottomLeft: {
-bottom: 0,
-left: 0,
-borderBottomWidth: 4,
-borderLeftWidth: 4,
-},
-bottomRight: {
-bottom: 0,
-right: 0,
-borderBottomWidth: 4,
-borderRightWidth: 4,
-},
-scannerInstructions: {
-color: 'white',
-fontSize: 16,
-textAlign: 'center',
-marginTop: 40,
-paddingHorizontal: 20,
-backgroundColor: 'rgba(0,0,0,0.6)',
-padding: 15,
-borderRadius: 10,
-},
-scannedOverlay: {
-position: 'absolute',
-top: 0,
-left: 0,
-right: 0,
-bottom: 0,
-backgroundColor: 'rgba(0,0,0,0.8)',
-justifyContent: 'center',
-alignItems: 'center',
-},
-scannedText: {
-color: 'white',
-fontSize: 18,
-fontWeight: 'bold',
-marginTop: 15,
-},
-// Resto de estilos (modales)
-modalOverlay: {
-flex: 1,
-backgroundColor: 'rgba(0,0,0,0.5)',
-justifyContent: 'center',
-padding: 20,
-},
-modalContent: {
-backgroundColor: 'white',
-borderRadius: 20,
-padding: 20,
-maxHeight: '90%',
-},
-modalTitle: {
-fontSize: 24,
-fontWeight: 'bold',
-marginBottom: 20,
-textAlign: 'center',
-color: '#1F2937',
-},
-label: {
-fontSize: 14,
-fontWeight: 'bold',
-color: '#374151',
-marginBottom: 8,
-marginTop: 15,
-},
-input: {
-borderWidth: 1,
-borderColor: '#D1D5DB',
-borderRadius: 10,
-padding: 12,
-fontSize: 16,
-backgroundColor: '#F9FAFB',
-},
-typeScroll: {
-marginBottom: 10,
-},
-typeButton: {
-paddingHorizontal: 15,
-paddingVertical: 10,
-borderRadius: 8,
-borderWidth: 2,
-borderColor: '#E5E7EB',
-marginRight: 8,
-backgroundColor: '#F9FAFB',
-},
-typeButtonActive: {
-borderColor: '#0691b4ff',
-backgroundColor: '#E0F2FE',
-},
-typeButtonText: {
-color: '#6B7280',
-fontWeight: 'bold',
-fontSize: 14,
-},
-typeButtonTextActive: {
-color: '#0691b4ff',
-},
-dateTimeRow: {
-flexDirection: 'row',
-gap: 10,
-},
-dateButton: {
-flex: 1,
-backgroundColor: '#E0F2FE',
-padding: 15,
-borderRadius: 10,
-borderWidth: 2,
-borderColor: '#0691b4ff',
-},
-timeButton: {
-flex: 1,
-backgroundColor: '#E0F2FE',
-padding: 15,
-borderRadius: 10,
-borderWidth: 2,
-borderColor: '#0691b4ff',
-},
-dateButtonText: {
-color: '#0691b4ff',
-fontWeight: 'bold',
-textAlign: 'center',
-},
-dropdown: {
-borderWidth: 1,
-borderColor: '#D1D5DB',
-borderRadius: 10,
-padding: 15,
-backgroundColor: '#F9FAFB',
-flexDirection: 'row',
-justifyContent: 'space-between',
-alignItems: 'center',
-},
-dropdownText: {
-fontSize: 16,
-color: '#374151',
-},
-dropdownArrow: {
-fontSize: 12,
-color: '#6B7280',
-},
-dropdownList: {
-  borderWidth: 1,
-  borderColor: '#D1D5DB',
-  borderRadius: 10,
-  marginTop: 5,
-  backgroundColor: 'white',
-  maxHeight: 200,
-  zIndex: 1000,
-},
-dropdownItem: {
-padding: 15,
-borderBottomWidth: 1,
-borderBottomColor: '#F3F4F6',
-},
-dropdownItemText: {
-fontSize: 14,
-color: '#374151',
-},
-modalButtons: {
-flexDirection: 'row',
-marginTop: 20,
-marginBottom: 10,
-gap: 10,
-},
-modalButton: {
-flex: 1,
-padding: 15,
-borderRadius: 10,
-alignItems: 'center',
-},
-cancelButton: {
-  backgroundColor: '#F3F4F6',
-  marginTop: 10,
-  padding: 15,
-  borderRadius: 10,
-  alignItems: 'center',
-  width: '100%',
-},
-cancelButtonText: {
-  color: '#374151',
-  fontWeight: 'bold',
-  fontSize: 16,
-},
-saveButton: {
-backgroundColor: '#0691b4ff',
-},
-saveButtonText: {
-color: 'white',
-fontWeight: 'bold',
-fontSize: 16,
-},
-extendQuestion: {
-fontSize: 16,
-textAlign: 'center',
-color: '#6B7280',
-marginBottom: 20,
-},
-finishQuestion: {
-fontSize: 16,
-textAlign: 'center',
-color: '#6B7280',
-marginBottom: 20,
-},
-paidButton: {
-backgroundColor: '#10B981',
-padding: 15,
-borderRadius: 10,
-marginBottom: 10,
-},
-debtButton: {
-backgroundColor: '#F59E0B',
-padding: 15,
-borderRadius: 10,
-marginBottom: 10,
-},
-confirmButton: {
-backgroundColor: '#0691b4ff',
-padding: 15,
-borderRadius: 10,
-marginBottom: 10,
-},
-finishButtonText: {
-color: 'white',
-fontWeight: 'bold',
-fontSize: 16,
-textAlign: 'center',
-},
+  container: { flex: 1, backgroundColor: "#F8FAFC" },
+  header: {
+    backgroundColor: "#2563EB",
+    paddingTop: 50,
+    paddingBottom: 20,
+    paddingHorizontal: 20,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderBottomLeftRadius: 24,
+    borderBottomRightRadius: 24,
+  },
+  backText: { color: "white", fontWeight: "600", fontSize: 16 },
+  headerTitle: { color: "white", fontWeight: "800", fontSize: 22 },
+  headerSubtitle: { color: "rgba(255,255,255,0.85)", textAlign: "center" },
+  addButton: {
+    backgroundColor: "rgba(255,255,255,0.2)",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+  },
+  addButtonText: { color: "white", fontWeight: "700" },
+  quickActions: { paddingHorizontal: 20, paddingTop: 14 },
+  qrButton: {
+    backgroundColor: "#0EA5E9",
+    padding: 12,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  qrButtonText: { color: "white", fontWeight: "700" },
+  content: { flex: 1, padding: 20 },
+  center: { flex: 1, justifyContent: "center", alignItems: "center" },
+  loadingText: { marginTop: 10, color: "#64748B" },
+  empty: { alignItems: "center", paddingTop: 90 },
+  emptyIcon: { fontSize: 52, marginBottom: 8 },
+  emptyTitle: { fontSize: 20, fontWeight: "700", color: "#1F2937" },
+  emptySubtitle: { color: "#64748B", marginTop: 6 },
+  rentalCard: {
+    backgroundColor: "white",
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 12,
+    elevation: 3,
+  },
+  rentalHeader: { flexDirection: "row", justifyContent: "space-between" },
+  rentalInfo: { flex: 1, paddingRight: 12 },
+  rentalAddress: { fontWeight: "700", color: "#0F172A", marginBottom: 4 },
+  rentalMachine: { color: "#475569", marginBottom: 6 },
+  rentalDates: { marginTop: 4 },
+  dateText: { color: "#64748B", fontSize: 12 },
+  rentalPrice: { alignItems: "flex-end" },
+  priceAmount: { fontWeight: "800", fontSize: 18, color: "#0F172A" },
+  timeRemaining: { paddingHorizontal: 8, paddingVertical: 5, borderRadius: 8, marginTop: 6 },
+  timeText: { color: "white", fontWeight: "700", fontSize: 11 },
+  rentalActions: { flexDirection: "row", gap: 8, marginTop: 12 },
+  actionButton: { flex: 1, borderRadius: 10, padding: 11, alignItems: "center" },
+  extendButton: { backgroundColor: "#0284C7" },
+  finishButton: { backgroundColor: "#10B981" },
+  actionButtonText: { color: "white", fontWeight: "700" },
+  disabledAction: { opacity: 0.55 },
+
+  scannerContainer: { flex: 1, backgroundColor: "black" },
+  scannerHeader: {
+    paddingTop: 52,
+    paddingBottom: 12,
+    paddingHorizontal: 20,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    backgroundColor: "rgba(0,0,0,0.6)",
+  },
+  scannerTitle: { color: "white", fontWeight: "700", fontSize: 16 },
+  closeScanner: { backgroundColor: "rgba(255,255,255,0.2)", padding: 8, borderRadius: 8 },
+  closeScannerText: { color: "white", fontWeight: "700" },
+  camera: { flex: 1 },
+  scannerOverlay: { flex: 1, justifyContent: "center", alignItems: "center" },
+  scannerFrame: { width: 250, height: 250 },
+  corner: { position: "absolute", width: 32, height: 32, borderColor: "#22D3EE" },
+  topLeft: { top: 0, left: 0, borderTopWidth: 4, borderLeftWidth: 4 },
+  topRight: { top: 0, right: 0, borderTopWidth: 4, borderRightWidth: 4 },
+  bottomLeft: { bottom: 0, left: 0, borderBottomWidth: 4, borderLeftWidth: 4 },
+  bottomRight: { bottom: 0, right: 0, borderBottomWidth: 4, borderRightWidth: 4 },
+  scannerInstructions: {
+    color: "white",
+    marginTop: 18,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  scannedOverlay: {
+    position: "absolute",
+    bottom: 40,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+  },
+  scannedText: { color: "white", marginTop: 8, fontWeight: "700" },
+
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "center",
+    padding: 16,
+  },
+  modalContent: {
+    backgroundColor: "white",
+    borderRadius: 18,
+    padding: 16,
+    maxHeight: "88%",
+  },
+  modalTitle: { fontSize: 22, fontWeight: "800", color: "#0F172A", marginBottom: 12, textAlign: "center" },
+  label: { marginTop: 12, marginBottom: 6, fontWeight: "700", color: "#334155" },
+  input: {
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: "#0F172A",
+    backgroundColor: "#F8FAFC",
+  },
+  hint: { color: "#64748B", marginTop: 8, fontSize: 12 },
+  typeButton: {
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    marginRight: 8,
+    marginBottom: 4,
+  },
+  typeButtonActive: { backgroundColor: "#DBEAFE", borderColor: "#2563EB" },
+  typeButtonText: { color: "#334155" },
+  typeButtonTextActive: { color: "#1D4ED8", fontWeight: "700" },
+  dateTimeRow: { flexDirection: "row", gap: 8 },
+  dateButton: {
+    flex: 1,
+    backgroundColor: "#F1F5F9",
+    borderRadius: 10,
+    padding: 10,
+    alignItems: "center",
+  },
+  timeButton: {
+    flex: 1,
+    backgroundColor: "#F1F5F9",
+    borderRadius: 10,
+    padding: 10,
+    alignItems: "center",
+  },
+  dateButtonText: { color: "#0F172A", fontWeight: "600", fontSize: 13 },
+
+  dropdown: {
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 10,
+    padding: 12,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    backgroundColor: "#F8FAFC",
+  },
+  dropdownText: { color: "#0F172A", flex: 1, paddingRight: 10 },
+  dropdownArrow: { color: "#64748B", fontWeight: "800" },
+  dropdownList: {
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    borderRadius: 10,
+    marginTop: 8,
+    maxHeight: 180,
+    backgroundColor: "white",
+  },
+  dropdownItem: {
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F1F5F9",
+  },
+  dropdownItemText: { color: "#0F172A" },
+
+  modalButtons: { flexDirection: "row", gap: 10, marginTop: 16 },
+  modalButton: { flex: 1, padding: 12, borderRadius: 10, alignItems: "center" },
+  cancelButton: { backgroundColor: "#E2E8F0" },
+  cancelButtonText: { color: "#334155", fontWeight: "700" },
+  saveButton: { backgroundColor: "#2563EB" },
+  saveButtonText: { color: "white", fontWeight: "700" },
+
+  extendQuestion: {
+    textAlign: "center",
+    marginBottom: 14,
+    color: "#64748B",
+    fontSize: 14,
+  },
+  confirmButton: { marginTop: 10, borderRadius: 12, paddingVertical: 12 },
 });
