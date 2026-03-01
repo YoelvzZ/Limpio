@@ -304,7 +304,9 @@ export default function PartnersScreen({ navigation }) {
             </View>
           ))
         )}
-      </ScrollView>      {/* Modal de Formulario */}
+      </ScrollView>
+
+      {/* Modal de Formulario */}
       <Modal visible={showForm} animationType="slide" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>

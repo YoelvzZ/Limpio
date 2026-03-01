@@ -251,7 +251,9 @@ export const extendRental = async (rentalId, machineId, additionalPrice) => {
     console.error("Error al extender alquiler:", error);
     throw error;
   }
-};// ==================== HISTORIAL DE PAGOS ====================
+};
+
+// ==================== HISTORIAL DE PAGOS ====================
 
 // Agregar un pago al historial
 export const addPayment = async (paymentData) => {
@@ -453,7 +455,9 @@ export const addPartner = async (partnerData) => {
     console.error("Error al agregar socio:", error);
     throw error;
   }
-};// Actualizar un socio
+};
+
+// Actualizar un socio
 export const updatePartner = async (partnerId, partnerData) => {
   try {
     const userId = auth.currentUser?.uid;
@@ -640,7 +644,9 @@ export const getSharedPartnerMachines = async () => {
   );
 
   return machineGroups.flat();
-};export const addRentalWithSync = async (rentalData) => {
+};
+
+export const addRentalWithSync = async (rentalData) => {
   const userId = auth.currentUser?.uid;
   if (!userId) throw new Error("No hay usuario autenticado");
 
