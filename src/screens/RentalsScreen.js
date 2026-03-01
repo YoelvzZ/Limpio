@@ -436,7 +436,9 @@ export default function RentalsScreen({ navigation }) {
         m.ownerUserId === formData.machineOwnerUserId,
     );
 
-  const selectedPartner = partners.find((p) => p.id === formData.partnerId);  if (loading) {
+  const selectedPartner = partners.find((p) => p.id === formData.partnerId);
+  
+  if (loading) {
     return (
       <View style={styles.container}>
         <View style={styles.header}>
