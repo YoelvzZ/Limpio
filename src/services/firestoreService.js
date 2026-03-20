@@ -22,11 +22,27 @@ export const getMachines = async () => {
 
     const machinesRef = collection(db, "users", userId, "machines");
     const snapshot = await getDocs(machinesRef);
-
-    return snapshot.docs.map((doc) => ({
+    const machines = snapshot.docs.map((doc) => ({
       id: doc.id,
       ...doc.data(),
     }));
+
+    // Ajustar estado visual usando alquileres activos por si falló la escritura
+    // de estado en la lavadora al sincronizar entre cuentas.
+    const rentalsRef = collection(db, "users", userId, "rentals");
+    const activeRentalsQ = query(rentalsRef, where("status", "==", "activo"));
+    const activeRentalsSnap = await getDocs(activeRentalsQ);
+    const rentedMachineIds = new Set(
+      activeRentalsSnap.docs
+        .map((rentalDoc) => rentalDoc.data()?.machineId)
+        .filter(Boolean),
+    );
+
+    return machines.map((machine) =>
+      rentedMachineIds.has(machine.id)
+        ? { ...machine, status: "alquilada" }
+        : machine,
+    );
   } catch (error) {
     console.error("Error al obtener lavadoras:", error);
     throw error;
@@ -296,20 +312,50 @@ export const getPayments = async () => {
 // ==================== PENDIENTES DE COBRO ====================
 
 // Agregar pendiente de cobro
-export const addPendingPayment = async (pendingData) => {
+export const addPendingPaymentWithSync = async (pendingData) => {
   try {
     const userId = auth.currentUser?.uid;
     if (!userId) throw new Error("No hay usuario autenticado");
 
     const pendingRef = collection(db, "users", userId, "pendingPayments");
-    const docRef = await addDoc(pendingRef, {
+    const createdAt = new Date().toISOString();
+
+    const localDoc = await addDoc(pendingRef, {
       ...pendingData,
-      createdAt: new Date().toISOString(),
+      ownerUserId: userId,
+      createdAt,
     });
 
-    return { id: docRef.id, ...pendingData };
+    if (pendingData.linkedUserId) {
+      try {
+        const remotePendingRef = collection(
+          db,
+          "users",
+          pendingData.linkedUserId,
+          "pendingPayments",
+        );
+
+        const remoteDoc = await addDoc(remotePendingRef, {
+          ...pendingData,
+          isSharedViewOnly: true,
+          linkedUserId: userId,
+          linkedPendingId: localDoc.id,
+          createdAt,
+        });
+
+        await updateDoc(doc(db, "users", userId, "pendingPayments", localDoc.id), {
+          linkedPendingId: remoteDoc.id,
+        });
+
+        return { id: localDoc.id, ...pendingData, linkedPendingId: remoteDoc.id };
+      } catch (remoteError) {
+        console.log("Pendiente local creado; sync remoto pendiente:", remoteError);
+      }
+    }
+
+    return { id: localDoc.id, ...pendingData };
   } catch (error) {
-    console.error("Error al agregar pendiente:", error);
+    console.error("Error al agregar pendiente sincronizado:", error);
     throw error;
   }
 };
@@ -334,17 +380,36 @@ export const getPendingPayments = async () => {
 };
 
 // Eliminar pendiente (cuando se paga o se cancela)
-export const deletePendingPayment = async (pendingId) => {
+export const deletePendingPaymentWithSync = async (pendingId) => {
   try {
     const userId = auth.currentUser?.uid;
     if (!userId) throw new Error("No hay usuario autenticado");
 
-    const pendingRef = doc(db, "users", userId, "pendingPayments", pendingId);
-    await deleteDoc(pendingRef);
+    const localRef = doc(db, "users", userId, "pendingPayments", pendingId);
+    const localSnap = await getDoc(localRef);
+    if (!localSnap.exists()) return pendingId;
+
+    const localData = localSnap.data();
+    await deleteDoc(localRef);
+
+    if (localData.linkedUserId && localData.linkedPendingId) {
+      try {
+        const remoteRef = doc(
+          db,
+          "users",
+          localData.linkedUserId,
+          "pendingPayments",
+          localData.linkedPendingId,
+        );
+        await deleteDoc(remoteRef);
+      } catch (remoteError) {
+        console.log("Pendiente local eliminado; delete remoto pendiente:", remoteError);
+      }
+    }
 
     return pendingId;
   } catch (error) {
-    console.error("Error al eliminar pendiente:", error);
+    console.error("Error al eliminar pendiente sincronizado:", error);
     throw error;
   }
 };
@@ -360,10 +425,73 @@ export const getPartners = async () => {
     const partnersRef = collection(db, "users", userId, "partners");
     const snapshot = await getDocs(partnersRef);
 
-    return snapshot.docs.map((doc) => ({
+    const partners = snapshot.docs.map((doc) => ({
       id: doc.id,
       ...doc.data(),
     }));
+
+    await Promise.all(
+      partners.map(async (partner) => {
+        if (
+          partner.relationshipType !== "outgoing" ||
+          partner.status !== "pending" ||
+          !partner.partnerUserId ||
+          !partner.relationshipId
+        ) {
+          return;
+        }
+
+        try {
+          let hasAccepted = false;
+
+          if (partner.counterpartDocId) {
+            const counterpartRef = doc(
+              db,
+              "users",
+              partner.partnerUserId,
+              "partners",
+              partner.counterpartDocId,
+            );
+            const counterpartSnap = await getDoc(counterpartRef);
+            hasAccepted =
+              counterpartSnap.exists() &&
+              counterpartSnap.data()?.status === "active";
+          }
+
+          if (!hasAccepted) {
+            const remotePartnersRef = collection(
+              db,
+              "users",
+              partner.partnerUserId,
+              "partners",
+            );
+            const remoteQ = query(
+              remotePartnersRef,
+              where("relationshipId", "==", partner.relationshipId),
+            );
+            const remoteSnapshot = await getDocs(remoteQ);
+            hasAccepted = remoteSnapshot.docs.some(
+              (remoteDoc) => remoteDoc.data().status === "active",
+            );
+          }
+
+          if (hasAccepted) {
+            await updateDoc(doc(db, "users", userId, "partners", partner.id), {
+              status: "active",
+              canUsePartnerMachines: true,
+              acceptedAt: new Date().toISOString(),
+              reconciledAt: new Date().toISOString(),
+            });
+            partner.status = "active";
+            partner.canUsePartnerMachines = true;
+          }
+        } catch (reconcileError) {
+          console.log("No se pudo reconciliar estado del socio:", reconcileError);
+        }
+      }),
+    );
+
+    return partners;
   } catch (error) {
     console.error("Error al obtener socios:", error);
     throw error;
@@ -427,7 +555,7 @@ export const addPartner = async (partnerData) => {
       partnerUserId,
       "partners",
     );
-    await addDoc(partnerPartnersRef, {
+    const receiverDoc = await addDoc(partnerPartnersRef, {
       name: userData.businessName || auth.currentUser?.email || "Socio",
       phone: userData.phone || "",
       notes: `Invitación enviada por ${partnerData.name || "un socio"}`,
@@ -442,6 +570,11 @@ export const addPartner = async (partnerData) => {
       invitedByName:
         userData.businessName || auth.currentUser?.email || "Usuario",
       partnerBusinessName: partnerUserData.businessName || "",
+      counterpartDocId: senderDoc.id,
+    });
+
+    await updateDoc(doc(db, "users", userId, "partners", senderDoc.id), {
+      counterpartDocId: receiverDoc.id,
     });
 
     return {
@@ -450,6 +583,7 @@ export const addPartner = async (partnerData) => {
       partnerUserId,
       relationshipId,
       status: "pending",
+      counterpartDocId: receiverDoc.id,
     };
   } catch (error) {
     console.error("Error al agregar socio:", error);
@@ -553,26 +687,45 @@ export const acceptPartnerInvitation = async (partnerId) => {
     acceptedAt: new Date().toISOString(),
   });
 
-  const otherRef = collection(
-    db,
-    "users",
-    invitation.partnerUserId,
-    "partners",
-  );
-  const q = query(
-    otherRef,
-    where("relationshipId", "==", invitation.relationshipId),
-  );
-  const other = await getDocs(q);
-  await Promise.all(
-    other.docs.map((item) =>
-      updateDoc(item.ref, {
+  try {
+    if (invitation.counterpartDocId) {
+      const counterpartRef = doc(
+        db,
+        "users",
+        invitation.partnerUserId,
+        "partners",
+        invitation.counterpartDocId,
+      );
+      await updateDoc(counterpartRef, {
         status: "active",
         canUsePartnerMachines: true,
         acceptedAt: new Date().toISOString(),
-      }),
-    ),
-  );
+      });
+    } else {
+      const otherRef = collection(
+        db,
+        "users",
+        invitation.partnerUserId,
+        "partners",
+      );
+      const q = query(
+        otherRef,
+        where("relationshipId", "==", invitation.relationshipId),
+      );
+      const other = await getDocs(q);
+      await Promise.all(
+        other.docs.map((item) =>
+          updateDoc(item.ref, {
+            status: "active",
+            canUsePartnerMachines: true,
+            acceptedAt: new Date().toISOString(),
+          }),
+        ),
+      );
+    }
+  } catch (syncError) {
+    console.log("Aceptación local completada; sync remoto pendiente:", syncError);
+  }
 
   return true;
 };
@@ -588,18 +741,34 @@ export const rejectPartnerInvitation = async (partnerId) => {
 
   await deleteDoc(myRef);
 
-  const otherRef = collection(
-    db,
-    "users",
-    invitation.partnerUserId,
-    "partners",
-  );
-  const q = query(
-    otherRef,
-    where("relationshipId", "==", invitation.relationshipId),
-  );
-  const other = await getDocs(q);
-  await Promise.all(other.docs.map((item) => deleteDoc(item.ref)));
+  try {
+    if (invitation.counterpartDocId) {
+      await deleteDoc(
+        doc(
+          db,
+          "users",
+          invitation.partnerUserId,
+          "partners",
+          invitation.counterpartDocId,
+        ),
+      );
+    } else {
+      const otherRef = collection(
+        db,
+        "users",
+        invitation.partnerUserId,
+        "partners",
+      );
+      const q = query(
+        otherRef,
+        where("relationshipId", "==", invitation.relationshipId),
+      );
+      const other = await getDocs(q);
+      await Promise.all(other.docs.map((item) => deleteDoc(item.ref)));
+    }
+  } catch (syncError) {
+    console.log("Rechazo local completado; sync remoto pendiente:", syncError);
+  }
 
   return true;
 };
@@ -665,46 +834,54 @@ export const addRentalWithSync = async (rentalData) => {
     rentalData.machineOwnerUserId &&
     rentalData.machineOwnerUserId !== userId
   ) {
-    const remoteRentalPayload = {
-      ...rentalData,
-      machineId: rentalData.machineId,
-      status: "activo",
-      createdAt,
-      createdByUserId: userId,
-      createdByPartnerName: rentalData.partnerName || "Socio",
-      isSharedViewOnly: true,
-      linkedRentalId: localDoc.id,
-    };
+    try {
+      const remoteRentalPayload = {
+        ...rentalData,
+        machineId: rentalData.machineId,
+        status: "activo",
+        createdAt,
+        createdByUserId: userId,
+        createdByPartnerName: rentalData.partnerName || "Socio",
+        isSharedViewOnly: true,
+        linkedRentalId: localDoc.id,
+      };
 
-    const remoteRentalsRef = collection(
-      db,
-      "users",
-      rentalData.machineOwnerUserId,
-      "rentals",
-    );
-    const remoteDoc = await addDoc(remoteRentalsRef, remoteRentalPayload);
-
-    await updateDoc(doc(db, "users", userId, "rentals", localDoc.id), {
-      linkedRentalId: remoteDoc.id,
-      linkedUserId: rentalData.machineOwnerUserId,
-      sharedMode: true,
-    });
-
-    await updateDoc(
-      doc(
+      const remoteRentalsRef = collection(
         db,
         "users",
         rentalData.machineOwnerUserId,
-        "machines",
-        rentalData.machineId,
-      ),
-      {
-        status: "alquilada",
-        updatedAt: new Date().toISOString(),
-      },
-    );
+        "rentals",
+      );
+      const remoteDoc = await addDoc(remoteRentalsRef, remoteRentalPayload);
 
-    return { id: localDoc.id, ...rentalData, linkedRentalId: remoteDoc.id };
+      await updateDoc(doc(db, "users", userId, "rentals", localDoc.id), {
+        linkedRentalId: remoteDoc.id,
+        linkedUserId: rentalData.machineOwnerUserId,
+        sharedMode: true,
+      });
+
+      try {
+        await updateDoc(
+          doc(
+            db,
+            "users",
+            rentalData.machineOwnerUserId,
+            "machines",
+            rentalData.machineId,
+          ),
+          {
+            status: "alquilada",
+            updatedAt: new Date().toISOString(),
+          },
+        );
+      } catch (machineSyncError) {
+        console.log("Alquiler sincronizado; estado remoto de máquina pendiente:", machineSyncError);
+      }
+
+      return { id: localDoc.id, ...rentalData, linkedRentalId: remoteDoc.id };
+    } catch (remoteError) {
+      console.log("Alquiler local creado; sync remoto pendiente:", remoteError);
+    }
   }
 
   if (rentalData.machineId && rentalData.price) {
@@ -730,27 +907,35 @@ export const finishRentalWithSync = async (rentalId, paid) => {
   });
 
   if (rental.linkedRentalId && rental.linkedUserId) {
-    const linkedRef = doc(
-      db,
-      "users",
-      rental.linkedUserId,
-      "rentals",
-      rental.linkedRentalId,
-    );
-    await updateDoc(linkedRef, {
-      status: "finalizado",
-      paid,
-      finishedAt: new Date().toISOString(),
-    });
-
-    if (rental.machineId) {
-      await updateDoc(
-        doc(db, "users", rental.linkedUserId, "machines", rental.machineId),
-        {
-          status: "disponible",
-          updatedAt: new Date().toISOString(),
-        },
+    try {
+      const linkedRef = doc(
+        db,
+        "users",
+        rental.linkedUserId,
+        "rentals",
+        rental.linkedRentalId,
       );
+      await updateDoc(linkedRef, {
+        status: "finalizado",
+        paid,
+        finishedAt: new Date().toISOString(),
+      });
+
+      if (rental.machineId) {
+        try {
+          await updateDoc(
+            doc(db, "users", rental.linkedUserId, "machines", rental.machineId),
+            {
+              status: "disponible",
+              updatedAt: new Date().toISOString(),
+            },
+          );
+        } catch (machineSyncError) {
+          console.log("Alquiler finalizado; estado remoto de máquina pendiente:", machineSyncError);
+        }
+      }
+    } catch (remoteError) {
+      console.log("Finalización local completada; sync remoto pendiente:", remoteError);
     }
   } else if (rental.machineId) {
     await updateMachine(rental.machineId, { status: "disponible" });
@@ -765,16 +950,26 @@ export const getPartnerStats = async (partnerId) => {
     const userId = auth.currentUser?.uid;
     if (!userId) throw new Error("No hay usuario autenticado");
 
-    // Obtener todos los alquileres del socio (finalizados)
+    const partnerRef = doc(db, "users", userId, "partners", partnerId);
+    const partnerSnap = await getDoc(partnerRef);
+    const partner = partnerSnap.exists() ? partnerSnap.data() : null;
+
+    // Cargar alquileres del usuario y calcular por varios criterios para soportar
+    // relaciones sincronizadas entre cuentas.
     const rentalsRef = collection(db, "users", userId, "rentals");
-    const q = query(rentalsRef, where("partnerId", "==", partnerId));
-    const snapshot = await getDocs(q);
+    const snapshot = await getDocs(rentalsRef);
+    const rentals = snapshot
+      .docs
+      .map((rentalDoc) => rentalDoc.data())
+      .filter((rental) => {
+        if (rental.partnerId === partnerId) return true;
+        if (partner?.partnerUserId && rental.createdByUserId === partner.partnerUserId) return true;
+        if (partner?.partnerUserId && rental.linkedUserId === partner.partnerUserId) return true;
+        return false;
+      });
 
-    const rentals = snapshot.docs.map((doc) => doc.data());
-
-    // Calcular totales
     const totalRentals = rentals.length;
-    const totalRevenue = rentals.reduce((sum, r) => sum + (r.price || 0), 0);
+    const totalRevenue = rentals.reduce((sum, rental) => sum + (rental.price || 0), 0);
 
     return {
       totalRentals,

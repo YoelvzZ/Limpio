@@ -19,10 +19,9 @@ import {
   getMachines,
   addPayment,
   addPendingPayment,
+  addPendingPaymentWithSync,
   getPartners,
   getSharedPartnerMachines,
-  updateMachine,
-  extendRental,
 } from "../services/firestoreService";
 
 import {
@@ -265,47 +264,42 @@ export default function RentalsScreen({ navigation }) {
   };
 
   const handleFinishRental = async (paid) => {
-    if (!showFinishModal) return;
+  if (!showFinishModal) return;
 
-    try {
-      const rental = showFinishModal;
-      const machine = machines.find((m) => m.id === rental.machineId);
+  try {
+    const rental = showFinishModal;
+    const machine = machines.find((m) => m.id === rental.machineId);
 
-      if (paid) {
-        if (rental.partnerId) {
-          const partner = partners.find((p) => p.id === rental.partnerId);
+    if (paid) {
+      // VERIFICAR SI HAY SOCIO INVOLUCRADO
+      if (rental.partnerId) {
+        const partner = partners.find((p) => p.id === rental.partnerId);
 
-          if (partner) {
-            const partnerAmount = Math.floor(
-              rental.price * (partner.percentage / 100),
-            );
-            const yourAmount = rental.price - partnerAmount;
+        if (partner) {
+          // CALCULAR DIVISIÓN
+          const partnerAmount = Math.floor(
+            rental.price * (partner.percentage / 100),
+          );
+          const yourAmount = rental.price - partnerAmount;
 
-            await addPayment({
-              amount: yourAmount,
-              date: new Date().toISOString().split("T")[0],
-              machineNumber: machine?.number || "Socio",
-              address: `${rental.addressType} ${rental.address}`,
-              type: "pagado",
-              notes: `Tu ${100 - partner.percentage}% (Socio: ${partner.name})`,
-            });
+          // TU PARTE
+          await addPayment({
+            amount: yourAmount,
+            date: new Date().toISOString().split("T")[0],
+            machineNumber: machine?.number || "Socio",
+            address: `${rental.addressType} ${rental.address}`,
+            type: "pagado",
+            notes: `Tu ${100 - partner.percentage}% (Socio: ${partner.name})`,
+          });
 
-            Alert.alert(
-              "💰 Pago Dividido",
-              `Total: $${rental.price.toLocaleString()}\n\n` +
-                `• Tú (${100 - partner.percentage}%): $${yourAmount.toLocaleString()}\n` +
-                `• ${partner.name} (${partner.percentage}%): $${partnerAmount.toLocaleString()}`,
-            );
-          } else {
-            await addPayment({
-              amount: rental.price,
-              date: new Date().toISOString().split("T")[0],
-              machineNumber: machine?.number || "Socio",
-              address: `${rental.addressType} ${rental.address}`,
-              type: "pagado",
-            });
-          }
+          Alert.alert(
+            "💰 Pago Dividido",
+            `Total: $${rental.price.toLocaleString()}\n\n` +
+              `• Tú (${100 - partner.percentage}%): $${yourAmount.toLocaleString()}\n` +
+              `• ${partner.name} (${partner.percentage}%): $${partnerAmount.toLocaleString()}`,
+          );
         } else {
+          // SOCIO NO ENCONTRADO - TODO PARA TI
           await addPayment({
             amount: rental.price,
             date: new Date().toISOString().split("T")[0],
@@ -315,30 +309,64 @@ export default function RentalsScreen({ navigation }) {
           });
         }
       } else {
-        await addPendingPayment({
-          clientName: "Cliente",
-          address: `${rental.addressType} ${rental.address}`,
+        // SIN SOCIO - TODO PARA TI
+        await addPayment({
           amount: rental.price,
-          machineNumber: machine?.number || "Socio",
           date: new Date().toISOString().split("T")[0],
-          partnerId: rental.partnerId || null,
+          machineNumber: machine?.number || "Socio",
+          address: `${rental.addressType} ${rental.address}`,
+          type: "pagado",
         });
       }
+    } else {
+      const pendingPayload = {
+        clientName: "Cliente",
+        address: `${rental.addressType} ${rental.address}`,
+        amount: rental.price,
+        machineNumber: machine?.number || "Socio",
+        date: new Date().toISOString().split("T")[0],
+        partnerId: rental.partnerId || null,
+        linkedUserId: rental.linkedUserId || null,
+        linkedRentalId: rental.linkedRentalId || null,
+      };
 
-      await finishRentalWithSync(rental.id, paid);
-      await cancelRentalNotifications(rental.id);
-
-      if (!paid || !rental.partnerId) {
-        Alert.alert("Éxito", paid ? "Pago registrado" : "Agregado a pendientes");
+      if (rental.partnerId) {
+        const partner = partners.find((p) => p.id === rental.partnerId);
+        if (partner) {
+          const partnerAmount = Math.floor(
+            rental.price * (partner.percentage / 100),
+          );
+          pendingPayload.ownerAmount = rental.price - partnerAmount;
+          pendingPayload.partnerAmount = partnerAmount;
+          pendingPayload.partnerName = partner.name;
+          pendingPayload.partnerPercentage = partner.percentage;
+        }
       }
 
-      setShowFinishModal(null);
-      loadData();
-    } catch (error) {
-      console.error("Error al finalizar:", error);
-      Alert.alert("Error", "No se pudo finalizar el alquiler");
+      const savePending =
+        addPendingPaymentWithSync || addPendingPayment;
+      await savePending(pendingPayload);
     }
-  };
+
+    await finishRentalWithSync(rental.id, paid);
+
+    // Cancelar notificaciones
+    await cancelRentalNotifications(rental.id);
+
+    if (!paid || !rental.partnerId) {
+      Alert.alert(
+        "Éxito",
+        paid ? "Pago registrado" : "Agregado a pendientes",
+      );
+    }
+
+    setShowFinishModal(null);
+    loadData();
+  } catch (error) {
+    console.error("Error al finalizar:", error);
+    Alert.alert("Error", "No se pudo finalizar el alquiler");
+  }
+};
 
   const resetForm = () => {
     const availableMachines = machines
